@@ -17,7 +17,7 @@ const (
 	Version = 2.0
 
 	// Base API URL.
-	APIURL = "https://torrentapi.org/pubapi_v2.php?"
+	APIURL = "https://torrentapi.org/pubapi_v2.1.php?"
 
 	// Token expiration time (default is 15 min, but let's expire it after 890 seconds just to be safe.
 	TokenExpiration = time.Second * 890
