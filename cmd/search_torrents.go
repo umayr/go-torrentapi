@@ -6,7 +6,7 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/qopher/go-torrentapi"
+	"github.com/umayr/go-torrentapi"
 )
 
 // flags
@@ -39,7 +39,7 @@ func main() {
 		flag.PrintDefaults()
 		return
 	}
-	api, err := torrentapi.Init()
+	api, err := torrentapi.New()
 	if err != nil {
 		fmt.Printf("Error while querying torrentapi %s", err)
 		return
