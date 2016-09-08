@@ -13,7 +13,7 @@ import (
 
 const (
 	// Supported torrentapi version.
-	version = "v2.1"
+	version = "v2"
 
 	// Base API URL.
 	apiURL = "https://torrentapi.org/pubapi_%s.php?"
