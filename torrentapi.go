@@ -1,9 +1,8 @@
-// torrentapi provides simple and easy Golang interface for RARBG Torrent API v2 (https://torrentapi.org)
+// Package torrentapi provides simple and easy Golang interface for RARBG Torrent API v2 (https://torrentapi.org)
 package torrentapi
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -14,17 +13,20 @@ import (
 
 const (
 	// Supported torrentapi version.
-	Version = 2.0
+	version = "v2.1"
 
 	// Base API URL.
-	APIURL = "https://torrentapi.org/pubapi_v2.1.php?"
+	apiURL = "https://torrentapi.org/pubapi_%s.php?"
 
 	// Token expiration time (default is 15 min, but let's expire it after 890 seconds just to be safe.
-	TokenExpiration = time.Second * 890
-)
+	tokenExpiration = time.Second * 890
 
-// for testing purposes
-var apiurl = APIURL
+	// Error code API returns when token has expired
+	errCodeTokenExpired = 4
+
+	// Error code API returns when there's no torrents to show
+	errCodeNoTorrents = 20
+)
 
 // Token keeps token and it's expiration date.
 type Token struct {
@@ -32,7 +34,18 @@ type Token struct {
 	Expires time.Time `json:"-"`
 }
 
-// EpisodeInfo keepsinformation from "episode_info" key from results. Some of the fields may be empty.
+// IsValid Check if token is still valid.
+func (t *Token) IsValid() bool {
+	if t.Token == "" {
+		return false
+	}
+	if time.Now().After(t.Expires) {
+		return false
+	}
+	return true
+}
+
+// EpisodeInfo keeps information from "episode_info" key from results. Some of the fields may be empty.
 type EpisodeInfo struct {
 	ImDB       string `json:"imdb"`
 	TvDB       string `json:"tvdb"`
@@ -44,7 +57,7 @@ type EpisodeInfo struct {
 	Title      string `json:"title"`
 }
 
-// TorrentResults keeps information about single torrent returned from TorrentAPI. Some of the fields may be empty.
+// TorrentResult keeps information about single torrent returned from TorrentAPI. Some of the fields may be empty.
 type TorrentResult struct {
 	Title       string      `json:"title"`
 	Filename    string      `json:"filename"`
@@ -69,22 +82,31 @@ type APIResponse struct {
 	ErrorCode int             `json:"error_code"`
 }
 
-// IsValid Check if token is still valid.
-func (t *Token) IsValid() bool {
-	if t.Token == "" {
-		return false
-	}
-	if time.Now().After(t.Expires) {
-		return false
-	}
-	return true
+type expiredTokenError struct {
+	s string
+}
+
+func (e expiredTokenError) Error() string {
+	return e.s
+}
+
+// Config for API instance
+type Config struct {
+	Version         string
+	TokenExpiration time.Duration
+	Client          *http.Client
 }
 
 // API provides interface to access Torrent API.
 type API struct {
-	Query      string
-	APIToken   Token
+	Query    string
+	APIToken Token
+
 	categories []int
+
+	apiURL          string
+	fetch           func(string) (*http.Response, error)
+	tokenExpiration time.Duration
 }
 
 // SearchString adds search string to search query.
@@ -105,13 +127,13 @@ func (api *API) SearchTVDB(seriesid string) *API {
 	return api
 }
 
-// SearchIMDB dds ImDB id to search query.
+// SearchImDB dds ImDB id to search query.
 func (api *API) SearchImDB(movieid string) *API {
 	api.Query += fmt.Sprintf("&search_imdb=%s", movieid)
 	return api
 }
 
-// SearchMovieDB adds TheMovieDB id to search query.
+// SearchTheMovieDB adds TheMovieDB id to search query.
 func (api *API) SearchTheMovieDB(movieid string) *API {
 	api.Query += fmt.Sprintf("&search_themoviedb=%s", movieid)
 	return api
@@ -146,14 +168,14 @@ func (api *API) Ranked(ranked bool) *API {
 }
 
 // MinSeeders specify minimum number of seeders.
-func (api *API) MinSeeders(min_seed int) *API {
-	api.Query += fmt.Sprintf("&min_seeders=%d", min_seed)
+func (api *API) MinSeeders(minSeed int) *API {
+	api.Query += fmt.Sprintf("&min_seeders=%d", minSeed)
 	return api
 }
 
 // MinLeechers specify minimum number of leechers.
-func (api *API) MinLeechers(min_leech int) *API {
-	api.Query += fmt.Sprintf("&min_leechers=%d", min_leech)
+func (api *API) MinLeechers(minLeech int) *API {
+	api.Query += fmt.Sprintf("&min_leechers=%d", minLeech)
 	return api
 }
 
@@ -170,24 +192,21 @@ func (api *API) Search() (TorrentResults, error) {
 }
 
 // getResults sends query to TorrentAPI and fetch the response.
-func getResults(query string) (*APIResponse, error) {
-	resp, err := http.Get(query)
+func (api *API) getResults(query string) (*APIResponse, error) {
+	resp, err := api.fetch(query)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	var api_response APIResponse
-	err = json.NewDecoder(resp.Body).Decode(&api_response)
-	return &api_response, err
+	var r APIResponse
+	err = json.NewDecoder(resp.Body).Decode(&r)
+	return &r, err
 }
-
-var getRes = getResults
 
 // call calls API and processes response.
 func (api *API) call() (data TorrentResults, err error) {
 	if !api.APIToken.IsValid() {
-		api.APIToken, err = renewToken()
-		if err != nil {
+		if err = api.renewToken(); err != nil {
 			return nil, err
 		}
 	}
@@ -198,60 +217,51 @@ func (api *API) call() (data TorrentResults, err error) {
 		}
 		api.Query += fmt.Sprintf("&category=%s", strings.Join(categories, ";"))
 	}
-	query := fmt.Sprintf("%s&token=%s%s", apiurl, api.APIToken.Token, api.Query)
-	api_response, err := getRes(query)
+	query := fmt.Sprintf("%s&token=%s%s", api.apiURL, api.APIToken.Token, api.Query)
+	r, err := api.getResults(query)
 	if err != nil {
 		return
 	}
-	data, err = api.processResponse(api_response)
+	data, err = api.processResponse(r)
 	if err != nil {
 		if _, ok := err.(*expiredTokenError); ok {
 			// Token expired, renew it and try again
-			api.APIToken, err = renewToken()
+			if err = api.renewToken(); err != nil {
+				return nil, err
+			}
+			r, err = api.getResults(query)
 			if err != nil {
 				return
 			}
-			api_response, err = getRes(query)
-			if err != nil {
-				return
-			}
-			data, err = api.processResponse(api_response)
+			data, err = api.processResponse(r)
 		}
 	}
 	api.initQuery()
 	return
 }
 
-type expiredTokenError struct {
-	s string
-}
-
-func (e expiredTokenError) Error() string {
-	return e.s
-}
-
 // Process JSON data received from TorrentAPI
-func (api *API) processResponse(api_response *APIResponse) (data TorrentResults, err error) {
-	if api_response.Torrents != nil {
+func (api *API) processResponse(r *APIResponse) (data TorrentResults, err error) {
+	if r.Torrents != nil {
 		// We have valid results
-		err = json.Unmarshal(api_response.Torrents, &data)
+		err = json.Unmarshal(r.Torrents, &data)
 		if err != nil {
-			err = errors.New(fmt.Sprintf("query: %s, Error: %s", api.Query, err.Error()))
+			err = fmt.Errorf("query: %s, Error: %s", api.Query, err.Error())
 		}
-	} else if api_response.Error != "" {
+	} else if r.Error != "" {
 		// There was API error
 		// Token expired
-		if api_response.ErrorCode == 4 {
+		if r.ErrorCode == errCodeTokenExpired {
 			return nil, &expiredTokenError{s: "expired token"}
 		}
 		// No torrents found
-		if api_response.ErrorCode == 20 {
+		if r.ErrorCode == errCodeNoTorrents {
 			return
 		}
-		err = errors.New(fmt.Sprintf("query: %s, Error: %s, Error code: %d)", api.Query, api_response.Error, api_response.ErrorCode))
+		err = fmt.Errorf("query: %s, Error: %s, Error code: %d)", api.Query, r.Error, r.ErrorCode)
 	} else {
 		// It shouldn't happen
-		err = errors.New(fmt.Sprintf("query: %s, Unknown error: %s", api.Query, err))
+		err = fmt.Errorf("query: %s, Unknown error: %s", api.Query, err)
 	}
 	// Clear Query variable
 	return data, err
@@ -264,31 +274,64 @@ func (api *API) initQuery() {
 }
 
 // RenewToken fetches new token.
-func RenewToken() (token Token, err error) {
-	resp, err := http.Get(apiurl + "get_token=get_token")
+func (api *API) renewToken() (err error) {
+	resp, err := api.fetch(api.apiURL + "get_token=get_token")
 	if err != nil {
 		return
 	}
 	defer resp.Body.Close()
-	err = json.NewDecoder(resp.Body).Decode(&token)
+	t := Token{}
+	err = json.NewDecoder(resp.Body).Decode(&t)
 	if err != nil {
 		return
 	}
-	token.Expires = time.Now().Add(TokenExpiration)
+	t.Expires = time.Now().Add(api.tokenExpiration)
+	api.APIToken = t
+
 	return
 }
 
-// for testing
-var renewToken = RenewToken
+// New initializes API object with default configuration, fetches new token and returns API instance.
+func New() (*API, error) {
+	api := new(API)
+	api.apiURL = fmt.Sprintf(apiURL, version)
+	api.fetch = http.Get
+	api.tokenExpiration = tokenExpiration
 
-// Init Initializes API object, fetches new token and returns API instance.
-func Init() (*API, error) {
-	token, err := renewToken()
-	if err != nil {
+	if err := api.renewToken(); err != nil {
 		return nil, err
 	}
-	api := new(API)
-	api.APIToken = token
+
 	api.initQuery()
-	return api, err
+	return api, nil
+}
+
+// NewWithConfig initializes API object with provided configuration, fetches new token and returns API instance.
+func NewWithConfig(conf *Config) (*API, error) {
+	api := new(API)
+
+	if conf.Version != "" {
+		api.apiURL = fmt.Sprintf(apiURL, conf.Version)
+	} else {
+		api.apiURL = fmt.Sprintf(apiURL, version)
+	}
+
+	if conf.Client != nil {
+		api.fetch = conf.Client.Get
+	} else {
+		api.fetch = http.Get
+	}
+
+	if conf.TokenExpiration != 0 {
+		api.tokenExpiration = conf.TokenExpiration
+	} else {
+		api.tokenExpiration = tokenExpiration
+	}
+
+	if err := api.renewToken(); err != nil {
+		return nil, err
+	}
+
+	api.initQuery()
+	return api, nil
 }
